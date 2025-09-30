@@ -1,346 +1,175 @@
-# farming_and_levelup.py — Auto Farming Grand Pirates (dengan Level Up Kapal)
-# Features:
-#   - Auto Restore Energi
-#   - Auto Adventure / Fight
-#   - Auto Level Up Kapal (Level Up Kapal + ATK)
-#   - Limit Detect (pause jika capek limit server)
-#   - Watchdog anti-stuck (cek setiap 20 detik)
-#   - Pause/Resume via command "pause" / "resume"
-# Requirements:
-#   pip install telethon python-dotenv
-
 import os
-import re
 import asyncio
-import random
-import logging
 import time
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
+import re
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
+from dotenv import load_dotenv
 
-# ---------------- config (.env) ----------------
-load_dotenv("tokekk.env")
-API_ID = int(os.getenv("API_ID") or 0)
-API_HASH = os.getenv("API_HASH") or ""
-PHONE = os.getenv("PHONE") or ""
-BOT_USERNAME = (os.getenv("BOT_USERNAME") or "GrandPiratesBot").lstrip('@')
-OWNER_ID = int(os.getenv("OWNER_ID") or 0)
+# --- Load data dari .env ---
+load_dotenv("kunci.env")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+PHONE = os.getenv("PHONE")
+BOT_USERNAME = os.getenv("BOT_USERNAME")  # target game bot
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
-if not API_ID or not API_HASH or not PHONE:
-    raise SystemExit("ERROR: Pastikan API_ID, API_HASH, PHONE ter-set di file token.env")
+# --- Inisialisasi Telethon ---
+client = TelegramClient("Petani_session", API_ID, API_HASH)
 
-# ---------------- logging ----------------
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
-logger = logging.getLogger("gp_bot")
+# --- Variabel kontrol ---
+running_maling = False
+running_kebun = False
+last_sent = {}  # {kode: timestamp}
+DELAY_BETWEEN_CODES = 120   # 2 menit
+DELAY_REPEAT_CODE = 3600    # 1 jam
 
-# ---------------- client ----------------
-SESSION_STRING = os.getenv("TELEGRAM_SESSION")
-if SESSION_STRING:
-    client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
-else:
-    client = TelegramClient("gp_combo_session_tokekk", API_ID, API_HASH)
+# EXP tracking
+exp_now = 0
+exp_max = 999999
 
-# ---------------- state ----------------
-attack_block_until = 0.0
-last_event_time = 0.0
-energy_threshold = 22
-last_action = None
-paused = False
-need_refresh_ship = True
-# State untuk Level Up Kapal
-exp_current = 0
-exp_max = None
-leveling = False
+# --- Baca codes.txt ---
+def load_codes():
+    if not os.path.exists("codes.txt"):
+        return []
+    with open("codes.txt", "r") as f:
+        codes = [line.strip() for line in f if line.strip()]
+    return codes
 
-# ---------------- regex ----------------
-# Farming
-energy_re = re.compile(r"Sisa energi:\s*(\d+)%", re.IGNORECASE)
-limit_msg_re = re.compile(r"batas maksimal melawan musuh|Kamu sudah mencapai batas maksimal", re.IGNORECASE)
-# Level Up Kapal
-exp_progress_re = re.compile(r"EXP:\s*\(([\d,]+)\/([\d,]+)\)", re.IGNORECASE)
-exp_gain_re = re.compile(r"❇️\s*([\d,]+)\s*EXP Kapal", re.IGNORECASE)
+# --- Parse EXP dari pesan /status ---
+def parse_exp(text):
+    global exp_now, exp_max
+    match = re.search(r"EXP:\s*([\d,]+)/([\d,]+)", text)
+    if match:
+        exp_now = int(match.group(1).replace(",", ""))
+        exp_max = int(match.group(2).replace(",", ""))
+        print(f"[STATUS] EXP {exp_now}/{exp_max}")
 
-# ---------------- helpers ----------------
-def parse_int(s: str) -> int:
-    """Mengubah string angka dengan koma menjadi integer"""
-    return int(s.replace(",", "").strip())
+# --- Tambah EXP dan log ---
+def add_exp(amount, sumber=""):
+    global exp_now, exp_max
+    exp_now += amount
+    print(f">> +{amount} EXP → {exp_now}/{exp_max} {sumber}")
 
-async def human_sleep(min_s=0.5, max_s=1.0):
-    """Jeda waktu dengan variasi acak untuk meniru perilaku manusia"""
-    await asyncio.sleep(random.uniform(min_s, max_s))
-
-async def robust_click(event, label_text):
-    """Klik tombol inline berdasarkan text, dengan upaya ganda jika gagal"""
-    try:
-        btns = await event.get_buttons()
-        if not btns:
-            return False
-        flat = [b.text for row in btns for b in row if getattr(b, "text", None)]
-        candidate = next((txt for txt in flat if label_text.lower() in txt.lower()), None)
-        if not candidate:
-            return False
-        
-        # Coba klik dengan text, lalu dengan index
-        for attempt in range(1, 4):
-            try:
-                await human_sleep(0.4, 0.9)
-                await event.click(text=candidate)
-                return True
-            except Exception:
-                try:
-                    idx = flat.index(candidate)
-                    await human_sleep(0.3, 0.7)
-                    await event.message.click(idx)
-                    return True
-                except Exception:
-                    if attempt < 3:
-                        await asyncio.sleep(0.5 + attempt * 0.3)
-                        continue
-                    else:
-                        return False
-    except Exception:
-        return False
-    return False
-
-# ---------------- level up flow ----------------
-async def start_levelup():
-    """Mulai proses level up kapal"""
-    global leveling
-    if leveling:
-        return
-    leveling = True
-    try:
-        print(">> EXP FULL → Mulai level up kapal")
-        await client.send_message(BOT_USERNAME, "/levelupKapal")
-        print(">> Kirim /levelupKapal")
-        await asyncio.sleep(4)
-        await client.send_message(BOT_USERNAME, "/levelupKapal_ATK")
-        print(">> Kirim /levelupKapal_ATK")
-    except Exception as e:
-        print("!! Gagal start levelup:", e)
-        leveling = False
-
-# ---------------- pause/resume ----------------
-@client.on(events.NewMessage(from_users=OWNER_ID))
-async def owner_control(event):
-    """Menangani perintah pause/resume dari OWNER_ID"""
-    global paused
-    msg = (event.raw_text or "").strip().lower()
-    if msg == "pause":
-        paused = True
-        await event.reply("⏸ Bot PAUSED (Farming & Level Up)")
-        print(">> Bot paused oleh owner.")
-    elif msg == "resume":
-        paused = False
-        await event.reply("▶️ Bot RESUMED (Farming & Level Up)")
-        print(">> Bot resumed oleh owner.")
-
-# ---------------- main handler ----------------
-@client.on(events.NewMessage(from_users=BOT_USERNAME))
-async def handler(event):
-    """Menangani semua pesan masuk dari bot Grand Pirates"""
-    global last_event_time, last_action, attack_block_until, paused, need_refresh_ship
-    global exp_current, exp_max, leveling
-
-    if paused:
-        print(">> (PAUSED) Pesan bot diabaikan.")
-        return
-    
-    # Blokir aksi jika masih dalam periode limit server
-    if attack_block_until and time.time() < attack_block_until and not leveling:
-        print(">> (LIMIT BLOCK) Bot menunggu limit selesai.")
-        return
-
-    try:
-        last_event_time = asyncio.get_event_loop().time()
-        text = event.raw_text or ""
-        lowered = text.lower()
-        print("\n>> Pesan bot:")
-        print(text[:1000])
-
-        # Refresh kapal sekali di awal
-        if need_refresh_ship:
-            await asyncio.sleep(1)
-            await client.send_message(BOT_USERNAME, "/kapal")
-            need_refresh_ship = False
-            return
-
-        # ==========================================================
-        # LOGIKA LEVEL UP KAPAL
-        # ==========================================================
-        
-        # Deteksi pesan konfirmasi level up
-        if "apa kamu yakin ingin meningkatkan" in lowered and "kapal" in lowered:
-            print(">> Deteksi pesan konfirmasi level up!")
-
-            while True:  # loop sampai berhasil
-                sukses = False
-                for attempt in range(5):
-                    if await robust_click(event, "confirm") or await robust_click(event, "yes"):
-                        print(f">> Klik Confirm sukses (percobaan {attempt+1})")
-                        sukses = True
-                        break
-                    else:
-                        print(f">> Tombol Confirm belum muncul (percobaan {attempt+1}), tunggu 2s...")
-                        await asyncio.sleep(2)
-
-                if sukses:
-                    break  # keluar loop, confirm berhasil
-                else:
-                    print("!! Gagal klik Confirm 5x, coba ulangi /levelupKapal_ATK")
-                    await asyncio.sleep(3)
-                    await client.send_message(BOT_USERNAME, "/levelupKapal_ATK")
-                    # loop ulang lagi, nunggu konfirmasi muncul
-            return
-
-
-        # Levelup sukses
-        if "berhasil meningkatkan level" in lowered:
-            print(">> LEVEL UP BERHASIL!")
-            exp_current = 0
-            exp_max = None
-            leveling = False
-            await asyncio.sleep(4)
-            await client.send_message(BOT_USERNAME, "/kapal")
-            print(">> Kirim /kapal untuk refresh status")
+# --- Cek EXP & levelup ---
+async def check_levelup():
+    global exp_now, exp_max
+    if exp_now >= exp_max:
+        try:
+            await client.send_message(BOT_USERNAME, "/levelup")
+            print("🎉 [LEVELUP] Kirim /levelup (EXP penuh)")
             await asyncio.sleep(3)
-            # Lanjut ke farming dengan kirim /adventure
-            await client.send_message(BOT_USERNAME, "/adventure")
-            return
+            await client.send_message(BOT_USERNAME, "/status")
+        except Exception as e:
+            print(f"[!] Gagal levelup: {e}")
 
-        # EXP progress
-        m_exp = exp_progress_re.search(text)
-        if m_exp:
-            exp_current = parse_int(m_exp.group(1))
-            exp_max = parse_int(m_exp.group(2))
-            print(f">> EXP Kapal: {exp_current}/{exp_max}")
-            if exp_max and exp_current >= exp_max and not leveling:
-                await start_levelup()
-            return
-
-        # ==========================================================
-        # LOGIKA FARMING
-        # ==========================================================
-        
-        # Jika sedang dalam proses level up, abaikan farming logic
-        if leveling:
-            return
-
-        # Detect server limit
-        if limit_msg_re.search(text):
-            now = time.time()
-            next_hour = (datetime.now() + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0)
-            attack_block_until = now + (next_hour - datetime.now()).total_seconds()
-            print(f">> DETECTED limit, farming pause hingga {datetime.fromtimestamp(attack_block_until).strftime('%H:%M:%S')}.")
-            return
-
-        # Energi restore
-        m_en = energy_re.search(text)
-        if m_en:
-            energy = int(m_en.group(1))
-            print(f">> Energi: {energy}%")
-            if energy <= energy_threshold and last_action != "restore_sent":
-                await asyncio.sleep(0.6)
-                await client.send_message(BOT_USERNAME, "/restore_x")
-                last_action = "restore_sent"
-                print(">> Energi kurang, kirim /restore_x")
-                return
-
-        if last_action == "restore_sent" and "berhasil memulihkan energi" in lowered:
-            await asyncio.sleep(0.8)
-            await client.send_message(BOT_USERNAME, "/adventure")
-            last_action = None
-            print(">> Energi pulih, kirim /adventure")
-            return
-
-        # EXP gain - update exp_current, lalu cek jika full
-        m_gain = exp_gain_re.search(text)
-        if m_gain:
-            gain = parse_int(m_gain.group(1))
-            exp_current += gain
-            if exp_max:
-                exp_current = min(exp_current, exp_max)
-                print(f">> +{gain} EXP → {exp_current}/{exp_max}")
-                if exp_current >= exp_max and not leveling:
-                    await start_levelup()
-            else:
-                print(f">> +{gain} EXP (sementara)")
-
-        # Auto fight / telusuri
-        if "dihadang" in lowered and "musuh" in lowered:
-            await robust_click(event, "Lawan")
-            print(">> Dihadang musuh, klik Lawan")
-            return
-
-        if "kamu menang" in lowered or "telusuri" in lowered or "gagal" in lowered:
-             # Cek dulu apakah ada button Telusuri/Adventure
-            if await robust_click(event, "Telusuri") or await robust_click(event, "Adventure"):
-                print(">> Menang/Pesan umum, klik Telusuri/Adventure")
-                return
-            else:
-                # Fallback: kirim /adventure jika tidak ada tombol
-                await client.send_message(BOT_USERNAME, "/adventure")
-                print(">> Fallback: kirim /adventure")
-                return
-
-        # Fallback click
-        buttons = await event.get_buttons()
-        if buttons:
-            for kw in ("telusuri", "adventure"):
-                if await robust_click(event, kw):
-                    print(f">> Fallback click: klik {kw}")
-                    return
-
-    except Exception as e:
-        logger.exception("Handler error: %s", e)
-
-# ---------------- watchdog ----------------
-async def watchdog():
-    """Mencegah bot stuck dengan mengirim /adventure secara berkala jika tidak ada aktivitas"""
-    global last_event_time, attack_block_until, paused
+# --- Task maling ---
+async def auto_maling():
+    global running_maling
     while True:
-        await asyncio.sleep(20)
-        
-        if paused or leveling: # Jika sedang pause atau level up, jangan watchdog
-            continue
-            
-        if attack_block_until and time.time() < attack_block_until: # Jika sedang limit server, jangan watchdog
-            continue
-            
-        # Jika tidak ada event selama lebih dari 15 detik
-        if asyncio.get_event_loop().time() - last_event_time > 15:
-            try:
-                await client.send_message(BOT_USERNAME, "/adventure")
-                print(">> WATCHDOG: sent /adventure")
-            except Exception as e:
-                print("!! WATCHDOG gagal /adventure:", e)
+        if running_maling:
+            codes = load_codes()
+            for code in codes:
+                now = time.time()
+                last_time = last_sent.get(code, 0)
+                if now - last_time >= DELAY_REPEAT_CODE:
+                    try:
+                        await client.send_message(BOT_USERNAME, code)
+                        print(f"[MALING] Kirim kode: {code}")
+                        last_sent[code] = now
+                    except Exception as e:
+                        print(f"[!] Gagal kirim {code}: {e}")
+                    await asyncio.sleep(DELAY_BETWEEN_CODES)
+                else:
+                    continue
+        else:
+            await asyncio.sleep(5)
 
-# ---------------- startup ----------------
+# --- Task kebun wortel ---
+async def auto_kebun():
+    global running_kebun
+
+    while True:
+        if running_kebun:
+            try:
+                # Tanam
+                await client.send_message(BOT_USERNAME, "/tanam_Wortel_25")
+                add_exp(75, "[KEBUN] Tanam wortel")
+                print("[KEBUN] Tanam wortel sukses")
+                await asyncio.sleep(2)
+
+                # Siram
+                await client.send_message(BOT_USERNAME, "/siram")
+                add_exp(50, "[KEBUN] Siram tanaman")
+                print("[KEBUN] Siram sukses")
+                await asyncio.sleep(2)
+
+                # Tunggu panen
+                print("[KEBUN] Menunggu 185 detik sampai panen...")
+                await asyncio.sleep(185)
+
+                # Panen
+                await client.send_message(BOT_USERNAME, "/ambilPanen")
+                add_exp(375, "[KEBUN] Panen wortel")
+                print("[KEBUN] Panen sukses")
+
+                # Cek level up
+                await check_levelup()
+
+                await asyncio.sleep(2)
+
+            except Exception as e:
+                print(f"[!] Error kebun: {e}")
+                await asyncio.sleep(5)
+        else:
+            await asyncio.sleep(5)
+
+# --- Handler pesan masuk dari owner ---
+@client.on(events.NewMessage(chats=OWNER_ID))
+async def handler_owner(event):
+    global running_maling, running_kebun
+    msg = event.raw_text.lower().strip()
+
+    if msg == "start maling":
+        running_maling = True
+        await event.reply("✅ Loop MALING dimulai")
+        print(">> Maling STARTED")
+
+    elif msg == "stop maling":
+        running_maling = False
+        await event.reply("⏹ Loop MALING dihentikan")
+        print(">> Maling STOPPED")
+
+    elif msg == "start kebun":
+        running_kebun = True
+        await event.reply("✅ Loop KEBUN dimulai")
+        print(">> Kebun STARTED")
+
+    elif msg == "stop kebun":
+        running_kebun = False
+        await event.reply("⏹ Loop KEBUN dihentikan")
+        print(">> Kebun STOPPED")
+
+    elif msg == "status":
+        await client.send_message(BOT_USERNAME, "/status")
+
+# --- Handler pesan dari game bot (baca EXP & log lain) ---
+@client.on(events.NewMessage(from_users=BOT_USERNAME))
+async def handler_bot(event):
+    text = event.raw_text
+    if "EXP:" in text:
+        parse_exp(text)
+    if "berhasil meningkatkan level" in text.lower():
+        print("🎉 [LEVELUP] Level naik! EXP direset")
+
+# --- Main ---
 async def main():
-    """Fungsi utama untuk menjalankan bot"""
-    await client.start(phone=PHONE)
-    logger.info("Client started")
-    await asyncio.sleep(1)
-    
-    # Kirim /kapal untuk inisiasi state
-    await client.send_message(BOT_USERNAME, "/kapal") 
-    
-    # Mulai Watchdog
-    client.loop.create_task(watchdog())
-    print(f">> Bot siap FARMING & LEVEL UP di @{BOT_USERNAME}")
+    print(">> Bot siap jalan.")
+    print("   Perintah: 'start maling' / 'stop maling'")
+    print("             'start kebun'  / 'stop kebun'")
+    await client.send_message(BOT_USERNAME, "/status")
+    asyncio.create_task(auto_maling())
+    asyncio.create_task(auto_kebun())
     await client.run_until_disconnected()
 
-if __name__ == "__main__":
-    try:
-        while True:
-            try:
-                asyncio.run(main())
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                print("!! Crash, restart 5s:", e)
-                time.sleep(5)
-    except KeyboardInterrupt:
-        print("Exiting.")
+with client:
+    client.loop.run_until_complete(main())
